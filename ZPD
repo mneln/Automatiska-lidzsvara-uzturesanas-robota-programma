@@ -1,0 +1,199 @@
+#include <PID_v1.h>
+#include <LMotorController.h>
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE // pārbauda, vai I2Cdev bibliotēkai ir iestatīta 
+//Arduino vadu implementācija, un ietver vadu bibliotēku.
+#include "Wire.h"
+#endif
+
+#define MIN_ABS_SPEED 20 // uz motoru padotās enerģijas minimums
+#define LOG_INPUT 1 // ievades datu reģistrēšana ir iespējota
+MPU6050 mpu; // programmā tiks saukts par mpu
+
+// mainīgie MPU6050 parvaldīšanai
+bool dmpReady = false; // digitālās kustības procesors nav gatavs
+uint8_t mpuIntStatus; // atbilstoši skaitlim no 1 - 255 katram tur pārtraukšanas informāciju
+uint8_t devStatus; // atgriež statusu pēc katras operācijas (0 = success, !0 = error)
+uint16_t packetSize;    // gaidāmais datu apstrādes platformas izmērs (default ir 42 bytes)
+uint16_t fifoCount;     // saskaita visus bytus fast in fast out starpliktuvē
+uint8_t fifoBuffer[64]; // FIFO uzglabāšanas buferis, saglaba vairākus mērījumus un atgriež aizkavētus merijumus(vrb atvasinašanai)
+
+
+// orientation/motion vars
+Quaternion q; // [w, x, y, z]       
+VectorFloat gravity;    // [x, y, z]  
+float ypr[3];           // [yaw, pitch, roll] container and gravity vector // tiks izmantots tikai otrais
+
+
+
+//PID , Tiek izveidots PID kontrolleris ar ievades, izvades un iestatījuma atsaucēm, 
+//kā arī regulēšanas parametriem.
+double originalSetpoint = 175.8; // stabilizācijas punkts
+double setpoint = originalSetpoint;
+double movingAngleOffset = 0.1; // kustīgā leņķa kļūda
+double input, output;
+int moveState = 0;
+double Kd = 2; // jo ātrāk krīt ātrāk reaģē, izmaiņas pieaugums, atkarigs no poz izmaiņas atrums
+double Ki = 40; //  uzkrātā kļūda
+double Kp = 40 ; // palēlina tuvojoties vēlamajai pozīcijai, atkarigs no poz
+//double Kd = 0; 
+//double Ki = 0;
+PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);// PID saņems info input 
+
+double motorSpeedFactorLeft = 0.5;
+double motorSpeedFactorRight = 0.5;
+//MOTOR CONTROLLER, pie kuras detaļas kājiņām, kas pievienots
+int ENA = 5;
+int IN1 = 6;
+int IN2 = 7;
+int IN3 = 8;
+int IN4 = 9;
+int ENB = 10;
+LMotorController motorController(ENA, IN1, IN2, ENB, IN3, IN4, motorSpeedFactorLeft, motorSpeedFactorRight);
+//pados info kontrolierim, sākuma palaišanai
+
+//timers
+long time1Hz = 0;
+long time5Hz = 0;
+
+volatile bool mpuInterrupt = false;  // vai MPU pārtraucējs nav iedabojies
+void dmpDataReady()
+{
+  mpuInterrupt = true; // ja rodas pārtraukums šis būs false, parādot to, ka MPU dati ir gatavi apstrādei
+}
+
+
+void setup()// vienu reizi programmas sākumā lai sagatavotu aparatūru, iestāda sākuma parametrus 
+//nepieciešamajām sistēmām, procesorā
+{
+
+// pārbauda vai ar signāla devēju ir kontakts, jeb ir gatavs
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE // ja ir pievienota wire.h bibliotēka
+  Wire.begin(); // uzsāk sakarus ar signala devēju
+  TWBR = 24; // I2C darbības ātrums, neatkarīhi vai 8 vai 16Hz procesora takts frekvence 
+#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE // uzsāk I2C bus darbību, izmantojot bibliotēku
+  Fastwire::setup(400, true); // ja nesanāk mēģina iesākt ar bibliotēku
+#endif
+
+  Serial.begin(115200); // ieslēdz sakaru ātrumu, uzstādīts pārraides (boud) ātrums
+  while (!Serial); // kamēr nav ieslēdzies seriālais mainīgais serialais ir false 
+
+  // serialais ir ielēdzies
+  Serial.println(F("Initializing I2C devices..."));
+  mpu.initialize(); // uzsāk mpu darbību
+
+  // savienojuma pārbaude ar MPU6050
+  Serial.println(F("Testing device connections..."));
+  Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
+
+  // ielādē un sagatavo digitalo kustibas procesoru
+  Serial.println(F("Initializing DMP..."));
+  devStatus = mpu.dmpInitialize();
+
+
+  // mpu iestāda žiraskopa sākum, pamata darus
+  mpu.setXGyroOffset(220);
+  mpu.setYGyroOffset(76);
+  mpu.setZGyroOffset(-85);
+  mpu.setZAccelOffset(1788);
+
+  // pārbauda vai darbojas, atgiež 0
+  if (devStatus == 0)
+  {
+     // iedarbina dmp procesors
+    Serial.println(F("Enabling DMP..."));
+    mpu.setDMPEnabled(true);
+
+    // ieslēdz Arduino pārrāvumu mehānismu
+    Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
+    attachInterrupt(1, dmpDataReady, RISING);//isl''edz pārrāvuma gaidisanu
+    mpuIntStatus = mpu.getIntStatus();
+
+    // DMP ir gatavs programmai
+    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+    dmpReady = true;
+
+    // DPM izmērs
+    packetSize = mpu.dmpGetFIFOPacketSize();
+
+    //Uzsāk PID darbību
+     
+    pid.SetMode(AUTOMATIC);
+    pid.SetSampleTime(10); // ik pēc cik ms iniciē pārrāvumu
+    pid.SetOutputLimits(-255, 255);
+  }
+  else
+  {
+    // ERROR!
+    // 1 = initial memory load failed
+    // 2 = DMP configuration updates failed
+    // (if it's going to break, usually the code will be 1)
+    Serial.print(F("DMP Initialization failed (code "));
+    Serial.print(devStatus);
+    Serial.println(F(")"));
+  }
+}
+
+
+void loop()
+{
+  // pārbauda vai digitālais kustības procesors ir gatavs
+  if (!dmpReady) return;
+
+  // gaida MPU partraukumu vai papildus kabatām FIFO buferī, kamer nav parravums un FIFO sk 
+  //ir mazaks par kabatas izmeru
+  while (!mpuInterrupt && fifoCount < packetSize)
+  {
+    //ja nav MPU datu 
+    pid.Compute(); //veic PID aprēķinus
+    motorController.move(output, MIN_ABS_SPEED); // no PID tiek saņemts output un padod info uz motokontrolielri
+
+  }
+
+  // atjauno iejaukšanās mainīgo un iegūst pārtraukuma bytu no MPU6050 sensora
+  mpuInterrupt = false;
+  mpuIntStatus = mpu.getIntStatus();
+
+  // iegūst šobrīdējo FIFO skaitu
+  fifoCount = mpu.getFIFOCount();
+
+  // pārbauda vai nav FIFO pārplūde
+  if ((mpuIntStatus & 0x10) || fifoCount == 1024)
+  {
+    // atjaunina FIFO pārplūduma gadījumā
+    mpu.resetFIFO();
+    Serial.println(F("FIFO overflow!"));
+
+  // pārbauda vai ir noticis digitalas kustibas procesora datu gatavības pārtraukus
+  // pārbauda vai FIFo dati ir atbi;stoši
+  }
+  else if (mpuIntStatus & 0x02)
+  {
+  
+    // wait for correct available data length, should be a VERY short wait
+    //sagaida nepieciešamo datu lielumu
+    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+
+    // nolasa FIFO kabatu
+    mpu.getFIFOBytes(fifoBuffer, packetSize);
+    
+    // izseko FIFO skaitu gadījumam ja paketes ir vairāk par vienu
+    fifoCount -= packetSize;// FIFO sk ir cik atlikušas vietas
+    
+//Eilera leņķu iegūšana grādos
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+#if LOG_INPUT // problēmu meklēšanas gadījumā tiek izmantots lai izdrukātu visus saņemtos mpu datus
+    Serial.print("ypr\t");
+    Serial.print(ypr[0] * 180 / M_PI);
+    Serial.print("\t");
+    Serial.print(ypr[1] * 180 / M_PI);
+    Serial.print("\t");
+    Serial.println(ypr[2] * 180 / M_PI);
+#endif
+    input = ypr[1] * 180 / M_PI + 180;// ypr[1] slipums
+  }
+}
